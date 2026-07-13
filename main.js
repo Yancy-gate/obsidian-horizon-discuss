@@ -24,10 +24,8 @@ const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/gi;
 const MAX_IMAGE_SIDE = 1280;
 const IMAGE_JPEG_QUALITY = 0.85;
 
-// OpenCode Zen：默认非 Claude；gpt-5.4-mini 兼顾质量与速度
+// OpenCode Zen API（模型由用户在设置中自行填写，插件不设默认）
 const OPENCODE_ZEN_BASE = "https://opencode.ai/zen/v1";
-const OPENCODE_DEFAULT_MODEL = "gpt-5.4-mini";
-const OPENCODE_VISION_MODEL = "gpt-5.4-mini";
 const SILICONFLOW_VISION_FALLBACK = [
   "zai-org/GLM-5V-Turbo",
   "Qwen/Qwen3-VL-32B-Instruct",
@@ -35,8 +33,8 @@ const SILICONFLOW_VISION_FALLBACK = [
 
 const DEFAULT_SETTINGS = {
   provider: "opencode-zen",
-  model: OPENCODE_DEFAULT_MODEL,
-  visionModel: OPENCODE_VISION_MODEL,
+  model: "",
+  visionModel: "",
   briefingDir: "Horizon/briefings",
   dailyLogDir: "Daily notes",
   wikiSessionsDir: "wiki/sessions",
@@ -128,6 +126,22 @@ function nodeGetText(url, headers = {}) {
     req.on("error", (e) => reject(new Error(`网络请求失败：${e.message}`)));
     req.end();
   });
+}
+
+function resolveChatModel(settings, needVision) {
+  const s = resolveSettings(settings);
+  if (needVision) {
+    const model = (s.visionModel || s.model || "").trim();
+    if (!model) {
+      throw new Error("请先在 设置 → Horizon Discuss 填写 Vision model（或 Default model）");
+    }
+    return model;
+  }
+  const model = (s.model || "").trim();
+  if (!model) {
+    throw new Error("请先在 设置 → Horizon Discuss 填写 Default model（OpenCode Zen model id）");
+  }
+  return model;
 }
 
 function resolveSettings(raw) {
@@ -1289,7 +1303,8 @@ class HorizonDiscussPlugin extends Plugin {
     this.addSettingTab(new HorizonDiscussSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(() => {
-      new Notice(`Horizon Discuss：OpenCode Zen / ${this.settings.model}`, 5000);
+      const label = (this.settings.model || "").trim() || "未配置模型";
+      new Notice(`Horizon Discuss · ${label}`, 5000);
     });
   }
 
@@ -1348,9 +1363,7 @@ class HorizonDiscussPlugin extends Plugin {
 
   async loadCredentials(opts = {}) {
     const needVision = !!opts.needVision;
-    const preferredModel = needVision
-      ? this.settings.visionModel || OPENCODE_VISION_MODEL
-      : this.settings.model || OPENCODE_DEFAULT_MODEL;
+    const preferredModel = resolveChatModel(this.settings, needVision);
 
     // 1) 默认：OpenCode Zen
     const zen = readOpenCodeZenKey();
@@ -1632,20 +1645,20 @@ class HorizonDiscussSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default model")
-      .setDesc("OpenCode Zen model id, e.g. gpt-5.4-mini / gpt-5.4 / deepseek-v4-flash")
+      .setDesc("Required. OpenCode Zen model id (run `agent-reach` / OpenCode docs for available ids).")
       .addText((t) =>
-        t.setValue(s.model).onChange(async (v) => {
-          this.plugin.settings.model = (v || OPENCODE_DEFAULT_MODEL).trim();
+        t.setValue(s.model || "").onChange(async (v) => {
+          this.plugin.settings.model = (v || "").trim();
           await this.plugin.saveSettings();
         })
       );
 
     new Setting(containerEl)
       .setName("Vision model")
-      .setDesc("Model used when images are attached")
+      .setDesc("Optional. Used when images are attached; falls back to Default model if empty.")
       .addText((t) =>
-        t.setValue(s.visionModel).onChange(async (v) => {
-          this.plugin.settings.visionModel = (v || OPENCODE_VISION_MODEL).trim();
+        t.setValue(s.visionModel || "").onChange(async (v) => {
+          this.plugin.settings.visionModel = (v || "").trim();
           await this.plugin.saveSettings();
         })
       );

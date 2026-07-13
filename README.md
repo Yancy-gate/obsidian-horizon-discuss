@@ -34,7 +34,7 @@ Install [OpenCode](https://opencode.ai/) and sign in. The plugin reads `opencode
 - Windows: `%USERPROFILE%\.local\share\opencode\auth.json`
 - macOS/Linux: `~/.local/share/opencode/auth.json`
 
-Default models: `claude-haiku-4-5` (fast, supports images). Change under **Settings → Horizon Discuss**.
+**You must set models yourself** under **Settings → Horizon Discuss** (`Default model`, optional `Vision model`). The plugin ships with no default model id. List available ids via OpenCode Zen / `https://opencode.ai/zen/v1/models`.
 
 ### Vault paths
 

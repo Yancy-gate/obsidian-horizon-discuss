@@ -1,9 +1,9 @@
 {
   "id": "horizon-discuss",
   "name": "Horizon Discuss",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "minAppVersion": "1.5.0",
-  "description": "Discuss daily briefings with AI (OpenCode Zen). Fetch web pages via Agent Reach. Daily ingest appends to one wiki/morning/log per day.",
+  "description": "Discuss daily briefing notes with AI via OpenCode Zen. Paste images, then ingest chats into morning notes, wiki sessions, and study logs.",
   "author": "Yancy-gate",
   "authorUrl": "https://github.com/Yancy-gate",
   "isDesktopOnly": true
