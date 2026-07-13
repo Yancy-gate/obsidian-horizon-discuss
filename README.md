@@ -1,44 +1,74 @@
 # Horizon Discuss
 
-Discuss daily briefing notes inside Obsidian with an AI assistant, then **ingest** selected messages into structured notes.
+**[中文说明 README.zh-CN.md](README.zh-CN.md)** · Desktop-only Obsidian plugin for briefing discussion + structured ingest.
 
-**Desktop only** (uses Node.js `fs` to read your local OpenCode Zen API key).
+Repository: [github.com/Yancy-gate/obsidian-horizon-discuss](https://github.com/Yancy-gate/obsidian-horizon-discuss) · [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases)
+
+Bind a daily briefing note → chat with AI (images, files, web pages) → ingest selected messages into morning notes, wiki sessions, and study logs.
+
+---
 
 ## Features
 
-- Side panel chat bound to a **briefing note** (auto-detect latest by filename pattern).
-- **OpenCode Zen** by default (`~/.local/share/opencode/auth.json`); falls back to the [Copilot](https://github.com/logancyang/obsidian-copilot) plugin API keys.
-- **Vision**: paste screenshots (Ctrl+V) or drag images into the panel.
-- **Attachments**: drag text files (`.md`, `.py`, …) into context.
-- **Markdown rendering** for assistant replies.
-- **Ingest** checked messages → one daily morning note + one wiki session + one study log entry (multiple ingests append sections, no duplicate pages).
-- Import recent **Copilot** conversation exports (optional).
-- Configurable vault paths, filename prefixes, review wikilinks, and AI focus topics.
+| Feature | Description |
+|---------|-------------|
+| Side panel chat | Context from bound briefing excerpt |
+| API | OpenCode Zen first; falls back to [Copilot](https://github.com/logancyang/obsidian-copilot) keys |
+| Models | **No built-in default** — you must set model ids in settings |
+| Vision | Paste screenshots (Ctrl+V); drag images |
+| Files | Drag text files (`.md`, `.py`, …) into context |
+| Web | [Agent Reach](https://github.com/Panniantong/Agent-Reach) routing via `agent-reach-fetch.py` |
+| Ingest | **One** morning note + **one** wiki session + **one** log entry **per day**; multiple ingests append sections |
+| Copilot import | Load recent `copilot-conversations` exports (optional) |
 
-## Install (manual)
+---
 
-1. Copy `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/horizon-discuss/`.
-2. Enable **Horizon Discuss** in **Settings → Community plugins** (or reload plugins).
-3. Open **Horizon Discuss** from the ribbon or command palette: `打开 Horizon 讨论入库面板`.
+## Install
 
-## Install (Community plugins)
+### Manual
 
-Search **Horizon Discuss** in Obsidian **Settings → Community plugins → Browse** after the plugin is approved.
+1. Download from [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases): `main.js`, `manifest.json`, `styles.css`, `agent-reach-fetch.py`
+2. Copy into `<vault>/.obsidian/plugins/horizon-discuss/`
+3. Enable **Horizon Discuss** under Settings → Community plugins
+4. `Ctrl+P` → **Reload app without saving**
 
-## Setup
+### BRAT
 
-### OpenCode Zen (recommended)
+Add repository: `Yancy-gate/obsidian-horizon-discuss`
+
+### Community plugins
+
+Search **Horizon Discuss** after the plugin is approved in the directory.
+
+---
+
+## First-time setup (required)
+
+### OpenCode Zen API key
 
 Install [OpenCode](https://opencode.ai/) and sign in. The plugin reads `opencode.key` from:
 
-- Windows: `%USERPROFILE%\.local\share\opencode\auth.json`
-- macOS/Linux: `~/.local/share/opencode/auth.json`
+| OS | Path |
+|----|------|
+| Windows | `%USERPROFILE%\.local\share\opencode\auth.json` |
+| macOS / Linux | `~/.local/share/opencode/auth.json` |
 
-**You must set models yourself** under **Settings → Horizon Discuss** (`Default model`, optional `Vision model`). The plugin ships with no default model id. List available ids via OpenCode Zen / `https://opencode.ai/zen/v1/models`.
+### Models (required)
+
+**Settings → Horizon Discuss**
+
+| Setting | Required | Notes |
+|---------|----------|-------|
+| **Default model** | **Yes** | OpenCode Zen model id for chat and ingest |
+| **Vision model** | No | Used when images are attached; if empty, uses Default model |
+
+The plugin ships with **empty** model fields. Chat will error until you configure a model id.
+
+List ids: `GET https://opencode.ai/zen/v1/models` (Bearer token) or OpenCode docs.
 
 ### Vault paths
 
-Defaults assume a generic layout:
+Generic defaults (change in settings or `data.json`):
 
 | Setting | Default |
 |---------|---------|
@@ -49,43 +79,91 @@ Defaults assume a generic layout:
 | Morning note prefix | `morning-` |
 | Session prefix | `briefing-session` |
 
-Adjust all paths in **Settings → Horizon Discuss → Vault paths**.
-
-### Example: Chinese briefing workflow
+Example `data.json` snippet:
 
 ```json
 {
-  "briefingDir": "其他/内参日报",
-  "dailyLogDir": "其他/每日自主学习",
-  "morningNotePrefix": "晨读-",
-  "sessionNamePrefix": "启示-内参",
-  "reviewLinks": "如何利用内参情报, _晨读模板",
-  "focusTopics": "your topics here"
+  "model": "your-model-id",
+  "visionModel": "your-vision-model-id",
+  "briefingDir": "Horizon/briefings",
+  "dailyLogDir": "Daily notes",
+  "morningNotePrefix": "morning-",
+  "sessionNamePrefix": "briefing-session",
+  "focusTopics": "your learning goals"
 }
 ```
 
-Paste into `.obsidian/plugins/horizon-discuss/data.json` or use the settings UI.
+`data.json` is local config and is not overwritten on plugin update.
 
-## Usage
+---
 
-1. **绑定今日内参** — bind today's briefing (or pick a file).
-2. Chat; paste images or drop files as needed.
-3. Check messages to keep, choose card type (理解 / 行动 / 判断).
-4. **整理入库 → 晨读+Wiki** — writes morning note, wiki session, and daily log entry.
+## Daily workflow
+
+1. Open panel → **绑定今日内参** (bind today's briefing)
+2. Ask questions; paste images, drop files, or include URLs (auto-fetched)
+3. Or click **抓取网页** to fetch a URL manually
+4. Check messages → pick ingest type (理解 / 行动 / 判断)
+5. **整理入库 → 晨读+Wiki**
+
+---
+
+## Ingest rules (v0.6+)
+
+Multiple ingests on the **same calendar day**:
+
+| Output | Behavior |
+|--------|----------|
+| Morning note | One file `{morningPrefix}YYYY-MM-DD.md`; sections `## Discussion · {title}` |
+| Wiki session | One file `{sessionPrefix}-YYYY-MM-DD.md`; sections `## {title}` |
+| Study log | One `# N. Briefing discussion · {date}` entry; subsections `### {title}` |
+| Re-ingest same title | **Updates** that section — no duplicate pages |
+
+---
+
+## Agent Reach web fetch
+
+Requires [Agent Reach](https://github.com/Panniantong/Agent-Reach) on the machine (optional but recommended for platform routing). The plugin runs `agent-reach-fetch.py` next to `main.js`.
+
+| Route | Backend |
+|-------|---------|
+| General web | Jina Reader |
+| YouTube | yt-dlp |
+| Bilibili | bili-cli / OpenCLI |
+| Twitter/X | OpenCLI / twitter-cli |
+| RSS | feedparser |
+| Fallback | Jina Reader |
+
+Settings → **Agent Reach**: Python path, auto-fetch URLs (max 3 per message), max content length.
+
+---
+
+## Troubleshooting
+
+| Issue | Fix |
+|-------|-----|
+| `Failed to fetch` | Reload Obsidian; set Default model; check Zen key and network/proxy |
+| Model not configured | Fill **Default model** in settings |
+| Weak vision | Use a vision-capable model id, or install Copilot for SiliconFlow fallback |
+| After update | Reload app; verify `data.json` |
+
+---
 
 ## Development
 
-No build step: `main.js` is the release artifact. Validate syntax:
+No build step:
 
 ```bash
 node --check main.js
 ```
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+---
 
 ## Privacy
 
-- API keys stay on your machine (OpenCode auth file or Copilot plugin settings).
-- No telemetry or external servers except your chosen LLM provider.
+- API keys stay on your device only
+- No plugin telemetry
+- Web fetch uses Jina Reader and/or local Agent Reach tools
+
+## License
+
+MIT — see [LICENSE](LICENSE).
