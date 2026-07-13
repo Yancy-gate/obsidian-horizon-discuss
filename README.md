@@ -25,12 +25,24 @@ Bind a daily briefing note → chat with AI (images, files, web pages) → inges
 
 ## Install
 
-### Manual
+### Option A: Install zip (recommended)
 
-1. Download from [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases): `main.js`, `manifest.json`, `styles.css`, `agent-reach-fetch.py`
-2. Copy into `<vault>/.obsidian/plugins/horizon-discuss/`
-3. Enable **Horizon Discuss** under Settings → Community plugins
-4. `Ctrl+P` → **Reload app without saving**
+1. Open [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases) (latest)
+2. Download **`horizon-discuss-x.x.x.zip`**
+3. Unzip and copy the **`horizon-discuss`** folder to:
+
+   ```
+   <vault>/.obsidian/plugins/horizon-discuss/
+   ```
+
+4. Settings → Community plugins → enable **Horizon Discuss**
+5. `Ctrl+P` → **Reload app without saving**
+
+The zip includes `main.js`, `manifest.json`, `styles.css`, `agent-reach-fetch.py`, and `INSTALL.md`.
+
+### Option B: Individual files
+
+Download the four plugin files from the release assets into `.obsidian/plugins/horizon-discuss/`.
 
 ### BRAT
 

@@ -25,12 +25,24 @@
 
 ## 安装
 
-### 手动
+### 方式一：安装包（推荐）
 
-1. 从 [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases) 下载 `main.js`、`manifest.json`、`styles.css`、`agent-reach-fetch.py`
-2. 放入 `<库>/.obsidian/plugins/horizon-discuss/`
-3. 设置 → 社区插件 → 启用 **Horizon Discuss**
-4. `Ctrl+P` → `Reload app without saving`
+1. 打开 [Releases](https://github.com/Yancy-gate/obsidian-horizon-discuss/releases) 最新版
+2. 下载 **`horizon-discuss-x.x.x.zip`**
+3. 解压，将 **`horizon-discuss` 文件夹** 复制到：
+
+   ```
+   <你的库>/.obsidian/plugins/horizon-discuss/
+   ```
+
+4. 设置 → 社区插件 → 启用 **Horizon Discuss**
+5. `Ctrl+P` → `Reload app without saving`
+
+zip 内已含 `main.js`、`manifest.json`、`styles.css`、`agent-reach-fetch.py` 及 `INSTALL.md`。
+
+### 方式二：手动挑选文件
+
+从 Release 分别下载上述四个文件，放入同一文件夹 `horizon-discuss`。
 
 ### BRAT
 
