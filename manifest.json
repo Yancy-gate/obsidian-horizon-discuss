@@ -1,0 +1,10 @@
+{
+  "id": "horizon-discuss",
+  "name": "Horizon Discuss",
+  "version": "0.4.0",
+  "minAppVersion": "1.5.0",
+  "description": "Discuss daily briefing notes with AI via OpenCode Zen. Paste images, then ingest chats into morning notes, wiki sessions, and study logs.",
+  "author": "Yancy-gate",
+  "authorUrl": "https://github.com/Yancy-gate",
+  "isDesktopOnly": true
+}
