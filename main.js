@@ -1,7 +1,12 @@
-const { Plugin, ItemView, WorkspaceLeaf, Notice, Modal, Setting, MarkdownRenderer, PluginSettingTab } = require("obsidian");
+const { Plugin, ItemView, WorkspaceLeaf, Notice, Modal, Setting, MarkdownRenderer, PluginSettingTab, requestUrl } = require("obsidian");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const https = require("https");
+const http = require("http");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const execFileAsync = promisify(execFile);
 
 const VIEW_TYPE = "horizon-discuss-view";
 const COPILOT_DATA = ".obsidian/plugins/copilot/data.json";
@@ -14,13 +19,15 @@ const TEXT_EXTS = new Set([
 const MAX_PENDING_IMAGES = 4;
 const MAX_PENDING_FILES = 6;
 const MAX_FILE_CHARS = 12000;
+const MAX_WEB_CHARS = 15000;
+const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/gi;
 const MAX_IMAGE_SIDE = 1280;
 const IMAGE_JPEG_QUALITY = 0.85;
 
-// OpenCode Zen：chat/completions 可用；claude-haiku 实测支持识图且较快
+// OpenCode Zen：默认非 Claude；gpt-5.4-mini 兼顾质量与速度
 const OPENCODE_ZEN_BASE = "https://opencode.ai/zen/v1";
-const OPENCODE_DEFAULT_MODEL = "claude-haiku-4-5";
-const OPENCODE_VISION_MODEL = "claude-haiku-4-5";
+const OPENCODE_DEFAULT_MODEL = "gpt-5.4-mini";
+const OPENCODE_VISION_MODEL = "gpt-5.4-mini";
 const SILICONFLOW_VISION_FALLBACK = [
   "zai-org/GLM-5V-Turbo",
   "Qwen/Qwen3-VL-32B-Instruct",
@@ -41,10 +48,92 @@ const DEFAULT_SETTINGS = {
   reviewLinks: "",
   dailyLogIntro: "> Review entries from Horizon Discuss.\n\n",
   focusTopics: "your learning goals and current projects",
+  agentReachPython: "",
+  autoFetchUrls: true,
+  maxWebChars: MAX_WEB_CHARS,
 };
 
+function extractUrls(text) {
+  const found = String(text || "").match(URL_REGEX) || [];
+  const seen = new Set();
+  const out = [];
+  for (let u of found) {
+    u = u.replace(/[.,;:!?)]+$/, "");
+    if (!seen.has(u)) {
+      seen.add(u);
+      out.push(u);
+    }
+  }
+  return out;
+}
+
+function defaultAgentReachPython() {
+  const home = os.homedir();
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(home, ".agent-reach-venv", "Scripts", "python.exe"),
+          path.join(home, "AppData", "Local", "Programs", "Python", "Python312", "python.exe"),
+        ]
+      : [
+          path.join(home, ".agent-reach-venv", "bin", "python3"),
+          path.join(home, ".agent-reach-venv", "bin", "python"),
+          "/usr/bin/python3",
+        ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return process.platform === "win32" ? "python" : "python3";
+}
+
+async function readWebViaJina(url) {
+  const target = url.startsWith("http") ? url : `https://${url}`;
+  const jinaUrl = `https://r.jina.ai/${target}`;
+  const res = await nodeGetText(jinaUrl, {
+    "User-Agent": "Horizon-Discuss/1.0 (Agent Reach Jina Reader)",
+    Accept: "text/plain",
+  });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Jina Reader ${res.status}: ${String(res.text || "").slice(0, 200)}`);
+  }
+  return res.text;
+}
+
+function nodeGetText(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      reject(new Error(`无效 URL：${url}`));
+      return;
+    }
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "GET",
+        headers,
+      },
+      (res) => {
+        let text = "";
+        res.on("data", (chunk) => {
+          text += chunk;
+        });
+        res.on("end", () => resolve({ status: res.statusCode || 0, text }));
+      }
+    );
+    req.on("error", (e) => reject(new Error(`网络请求失败：${e.message}`)));
+    req.end();
+  });
+}
+
 function resolveSettings(raw) {
-  return Object.assign({}, DEFAULT_SETTINGS, raw || {});
+  const s = Object.assign({}, DEFAULT_SETTINGS, raw || {});
+  if (!s.agentReachPython) s.agentReachPython = defaultAgentReachPython();
+  return s;
 }
 
 function reviewLinkLines(settings) {
@@ -114,6 +203,22 @@ function extractKeyPointsTable(organized) {
   }
   if (!bullets.length) bullets.push("See session body");
   return bullets.map((b, i) => `| ${i === 0 ? "Point" : "Extra"}${i + 1} | ${b.slice(0, 80)} |`).join("\n");
+}
+
+function replaceMarkdownSection(text, heading, newBlock) {
+  const body = text || "";
+  const idx = body.indexOf(heading);
+  if (idx === -1) return body.trimEnd() + newBlock;
+  const after = body.slice(idx + heading.length);
+  const nextIdx = after.search(/\n## /);
+  const tail = nextIdx === -1 ? "" : after.slice(nextIdx);
+  return body.slice(0, idx) + newBlock.trimEnd() + tail;
+}
+
+function upsertMarkdownSection(text, heading, newBlock) {
+  const body = text || "";
+  if (body.includes(heading)) return replaceMarkdownSection(body, heading, newBlock);
+  return body.trimEnd() + newBlock;
 }
 
 function readOpenCodeZenKey() {
@@ -223,6 +328,15 @@ function messageToApiContent(m, includeImages) {
       .join("");
     text = (text || "请结合下列附件回答") + blocks;
   }
+  if (m.webPages?.length) {
+    const blocks = m.webPages
+      .map(
+        (w) =>
+          `\n\n---\n网页：${w.url}\n来源：${w.backend || "Agent Reach"}\n\`\`\`\n${truncate(w.text || "", MAX_WEB_CHARS)}\n\`\`\``
+      )
+      .join("");
+    text = (text || "请结合下列网页内容回答") + blocks;
+  }
   const images = includeImages ? m.images || [] : [];
   if (!images.length) return text;
 
@@ -265,6 +379,7 @@ class HorizonDiscussView extends ItemView {
     this.messages = [];
     this.pendingImages = [];
     this.pendingFiles = [];
+    this.pendingWebPages = [];
     this.briefingPath = null;
     this.briefingExcerpt = "";
     this.statusEl = null;
@@ -317,6 +432,8 @@ class HorizonDiscussView extends ItemView {
     pickBtn.onclick = () => this.pickBriefingFile();
     const importBtn = row1.createEl("button", { text: "导入 Copilot 会话" });
     importBtn.onclick = () => this.importCopilotConversation();
+    const fetchWebBtn = row1.createEl("button", { text: "抓取网页" });
+    fetchWebBtn.onclick = () => this.promptFetchWebPage();
 
     const row2 = header.createDiv({ cls: "hd-row" });
     row2.createSpan({ cls: "hd-label", text: "入库类型" });
@@ -339,7 +456,7 @@ class HorizonDiscussView extends ItemView {
       cls: "hd-input",
       attr: {
         placeholder:
-          "围绕今日内参提问…（Ctrl+V 粘贴截图；可从文件管理器拖入图片/文本；Enter 发送，Shift+Enter 换行）",
+          "围绕今日内参提问…（可粘贴链接自动抓取；Ctrl+V 截图；拖入文件；Enter 发送）",
       },
     });
     this.inputEl.addEventListener("keydown", (e) => {
@@ -370,6 +487,7 @@ class HorizonDiscussView extends ItemView {
       this.messages = [];
       this.pendingImages = [];
       this.pendingFiles = [];
+      this.pendingWebPages = [];
       this.renderPending();
       this.renderMessages();
     };
@@ -387,11 +505,12 @@ class HorizonDiscussView extends ItemView {
   renderPending() {
     if (!this.pendingEl) return;
     this.pendingEl.empty();
-    if (!this.pendingImages.length && !this.pendingFiles.length) return;
+    if (!this.pendingImages.length && !this.pendingFiles.length && !this.pendingWebPages.length) return;
 
     const parts = [];
     if (this.pendingImages.length) parts.push(`${this.pendingImages.length} 图`);
     if (this.pendingFiles.length) parts.push(`${this.pendingFiles.length} 文件`);
+    if (this.pendingWebPages.length) parts.push(`${this.pendingWebPages.length} 网页`);
     this.pendingEl.createSpan({ cls: "hd-label", text: `待发送：${parts.join(" · ")}` });
 
     if (this.pendingImages.length) {
@@ -421,6 +540,58 @@ class HorizonDiscussView extends ItemView {
           this.renderPending();
         };
       }
+    }
+
+    if (this.pendingWebPages.length) {
+      const row = this.pendingEl.createDiv({ cls: "hd-pending-web" });
+      for (const w of this.pendingWebPages) {
+        const chip = row.createDiv({ cls: "hd-web-chip" });
+        const label = w.backend ? `${w.url} · ${w.backend}` : w.url;
+        chip.createSpan({ cls: "hd-web-name", text: label, attr: { title: label } });
+        const rm = chip.createEl("button", { text: "×", cls: "hd-web-remove" });
+        rm.onclick = () => {
+          this.pendingWebPages = this.pendingWebPages.filter((x) => x.id !== w.id);
+          this.renderPending();
+        };
+      }
+    }
+  }
+
+  async promptFetchWebPage() {
+    const url = window.prompt("输入要抓取的网页 URL（使用 Agent Reach 路由）", "https://");
+    if (!url || !url.trim()) return;
+    await this.fetchAndAddWebPage(url.trim());
+  }
+
+  async fetchAndAddWebPage(url) {
+    if (this.pendingWebPages.some((w) => w.url === url)) {
+      new Notice("该链接已在待发送列表");
+      return;
+    }
+    this.setStatus(`抓取网页中… ${url}`);
+    try {
+      const page = await this.plugin.fetchUrlWithAgentReach(url);
+      this.pendingWebPages.push({
+        id: uid(),
+        url: page.url,
+        backend: page.backend,
+        text: page.text,
+      });
+      this.renderPending();
+      this.setStatus(`已抓取 · ${page.backend}`);
+      new Notice(`网页已抓取：${page.backend}`);
+    } catch (e) {
+      console.error(e);
+      this.setStatus("网页抓取失败");
+      new Notice(`抓取失败：${e.message || e}`);
+    }
+  }
+
+  async autoFetchUrlsFromText(text) {
+    if (!this.plugin.settings.autoFetchUrls) return;
+    const urls = extractUrls(text).filter((u) => !this.pendingWebPages.some((w) => w.url === u));
+    for (const url of urls.slice(0, 3)) {
+      await this.fetchAndAddWebPage(url);
     }
   }
 
@@ -749,6 +920,9 @@ class HorizonDiscussView extends ItemView {
       if (m.files?.length) {
         top.createSpan({ cls: "hd-msg-badge", text: `${m.files.length} 附件` });
       }
+      if (m.webPages?.length) {
+        top.createSpan({ cls: "hd-msg-badge", text: `${m.webPages.length} 网页` });
+      }
       if (m.content) {
         const body = card.createDiv({
           cls: "hd-msg-body markdown-rendered" + (m.role === "assistant" ? " hd-msg-ai" : " hd-msg-user"),
@@ -774,18 +948,22 @@ class HorizonDiscussView extends ItemView {
   }
 
   async sendMessage() {
-    const text = (this.inputEl.value || "").trim();
+    let text = (this.inputEl.value || "").trim();
     const images = this.pendingImages.slice();
     const files = this.pendingFiles.slice();
-    if (!text && !images.length && !files.length) return;
+    if (!text && !images.length && !files.length && !this.pendingWebPages.length) return;
     if (!this.briefingPath) {
       new Notice("请先绑定今日内参");
       return;
     }
 
+    if (text) await this.autoFetchUrlsFromText(text);
+
+    const webPages = this.pendingWebPages.slice();
     const parts = [];
     if (images.length) parts.push(`${images.length} 张图`);
     if (files.length) parts.push(`${files.length} 个附件`);
+    if (webPages.length) parts.push(`${webPages.length} 个网页`);
     const focus = this.plugin.settings.focusTopics || DEFAULT_SETTINGS.focusTopics;
     const userText =
       text ||
@@ -796,6 +974,7 @@ class HorizonDiscussView extends ItemView {
     this.inputEl.value = "";
     this.pendingImages = [];
     this.pendingFiles = [];
+    this.pendingWebPages = [];
     this.renderPending();
 
     this.messages.push({
@@ -804,10 +983,11 @@ class HorizonDiscussView extends ItemView {
       content: userText,
       images,
       files,
+      webPages,
       selected: true,
     });
     await this.renderMessages();
-    this.setStatus(images.length ? "识图思考中…" : "思考中…");
+    this.setStatus(images.length ? "识图思考中…" : webPages.length ? "结合网页思考中…" : "思考中…");
 
     try {
       const creds = await this.plugin.loadCredentials({ needVision: images.length > 0 });
@@ -852,7 +1032,10 @@ class HorizonDiscussView extends ItemView {
           const fileNote = m.files?.length
             ? `\n（附件：${m.files.map((f) => f.name || f.path || "file").join("、")}）`
             : "";
-          return `【${m.role === "user" ? "用户" : "AI"}】\n${m.content || ""}${imgNote}${fileNote}`;
+          const webNote = m.webPages?.length
+            ? `\n（网页：${m.webPages.map((w) => w.url).join("、")}）`
+            : "";
+          return `【${m.role === "user" ? "用户" : "AI"}】\n${m.content || ""}${imgNote}${fileNote}${webNote}`;
         })
         .join("\n\n---\n\n");
 
@@ -914,7 +1097,7 @@ ${discussText.slice(0, 10000)}
       });
 
       this.setStatus(`已入库：${paths.wiki}`);
-      new Notice(`已写入晨读 + wiki + 每日日志`);
+      new Notice(`已追加到今日 wiki / 晨读 / 学习日志`);
     } catch (e) {
       console.error(e);
       this.setStatus("入库失败");
@@ -965,27 +1148,88 @@ function parseCopilotConversation(text) {
 
 async function chatCompletion(creds, messages, opts = {}) {
   const url = `${creds.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${creds.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: creds.model,
-      messages,
-      temperature: 0.25,
-      max_tokens: opts.maxTokens || 2048,
-    }),
+  const body = JSON.stringify({
+    model: creds.model,
+    messages,
+    temperature: 0.25,
+    max_tokens: opts.maxTokens || 2048,
   });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`${res.status} ${errText.slice(0, 300)}`);
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${creds.apiKey}`,
+  };
+
+  let res = await postJson(url, headers, body);
+  if (res.status < 200 || res.status >= 300) {
+    const errText = String(res.text || res.json || "").slice(0, 300);
+    throw new Error(`${res.status} ${errText}`);
   }
-  const data = await res.json();
+
+  const data = res.json;
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error("模型返回为空");
   return typeof content === "string" ? content.trim() : JSON.stringify(content);
+}
+
+async function postJson(url, headers, body) {
+  try {
+    const res = await requestUrl({
+      url,
+      method: "POST",
+      headers,
+      body,
+      throw: false,
+    });
+    if (res.status >= 200 && res.status < 300) {
+      return { status: res.status, text: res.text, json: res.json };
+    }
+    if (res.status > 0) {
+      return { status: res.status, text: res.text, json: res.json };
+    }
+  } catch (e) {
+    console.warn("requestUrl failed, falling back to Node https", e);
+  }
+  return nodePostJson(url, headers, body);
+}
+
+function nodePostJson(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      reject(new Error(`无效 URL：${url}`));
+      return;
+    }
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "POST",
+        headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      },
+      (res) => {
+        let text = "";
+        res.on("data", (chunk) => {
+          text += chunk;
+        });
+        res.on("end", () => {
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch (e) {
+            /* ignore */
+          }
+          resolve({ status: res.statusCode || 0, text, json });
+        });
+      }
+    );
+    req.on("error", (e) => reject(new Error(`网络请求失败：${e.message}`)));
+    req.write(body);
+    req.end();
+  });
 }
 
 class FilePickModal extends Modal {
@@ -1051,6 +1295,45 @@ class HorizonDiscussPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  getAgentReachScriptPath() {
+    return path.join(this.app.vault.configDir, "plugins", "horizon-discuss", "agent-reach-fetch.py");
+  }
+
+  async fetchUrlWithAgentReach(url) {
+    const s = resolveSettings(this.settings);
+    const maxChars = s.maxWebChars || MAX_WEB_CHARS;
+    const scriptPath = this.getAgentReachScriptPath();
+    const python = s.agentReachPython || defaultAgentReachPython();
+
+    if (fs.existsSync(scriptPath)) {
+      try {
+        const { stdout } = await execFileAsync(python, [scriptPath, url], {
+          maxBuffer: 12 * 1024 * 1024,
+          timeout: 120000,
+          windowsHide: true,
+        });
+        const data = JSON.parse(String(stdout || "").trim());
+        if (data.ok && data.text) {
+          return {
+            url: data.url || url,
+            backend: data.backend || "Agent Reach",
+            text: String(data.text).slice(0, maxChars),
+          };
+        }
+        throw new Error(data.error || "Agent Reach 返回空内容");
+      } catch (e) {
+        console.warn("agent-reach-fetch.py failed, fallback to Jina", e);
+      }
+    }
+
+    const text = await readWebViaJina(url);
+    return {
+      url,
+      backend: "Jina Reader (Agent Reach fallback)",
+      text: String(text).slice(0, maxChars),
+    };
   }
 
   async activateView() {
@@ -1165,11 +1448,35 @@ class HorizonDiscussPlugin extends Plugin {
     await this.ensureFolder(s.wikiSessionsDir);
     await this.ensureFolder(s.dailyLogDir);
 
-    const wikiName = `${s.sessionNamePrefix}-${title}-${day}`;
+    // 同一天共用一个 wiki session 页面（多次入库追加章节，同标题则更新）
+    const wikiName = `${s.sessionNamePrefix}-${day}`;
     const wikiPath = `${s.wikiSessionsDir}/${wikiName}.md`;
-    const wikiBody = `---
+    const wikiSectionHeading = `## ${title}`;
+    const wikiSection = `
+
+${wikiSectionHeading}
+
+**Type**: ${typeLabel} · **Briefing**: [[${briefingBase}]]
+
+${organized}
+
+<details>
+<summary>Discussion appendix · ${title}</summary>
+
+${truncate(discussText, 8000)}
+
+</details>
+`;
+
+    if (await this.app.vault.adapter.exists(wikiPath)) {
+      const prevWiki = await this.app.vault.adapter.read(wikiPath);
+      const updatedWiki = upsertMarkdownSection(prevWiki, wikiSectionHeading, wikiSection);
+      const withDate = updatedWiki.replace(/^updated: .+$/m, `updated: ${day}`);
+      await this.app.vault.adapter.write(wikiPath, withDate);
+    } else {
+      const wikiBody = `---
 type: session
-title: "${title}"
+title: "${s.sessionNamePrefix} ${day}"
 source: "[[${briefingBase}]]"
 note_type: ${type}
 created: ${day}
@@ -1183,30 +1490,22 @@ related:
 ${relatedYaml}
 ---
 
-${organized}
+# ${s.sessionNamePrefix} · ${day}
 
-## Discussion appendix
-
-<details>
-<summary>Expand</summary>
-
-${truncate(discussText, 8000)}
-
-</details>
+**Briefing**: [[${briefingBase}]]
+${wikiSection}
 `;
-    if (await this.app.vault.adapter.exists(wikiPath)) {
-      await this.app.vault.adapter.write(wikiPath, wikiBody);
-    } else {
       await this.app.vault.create(wikiPath, wikiBody);
     }
 
     const morningPath = `${s.briefingDir}/${s.morningNotePrefix}${day}.md`;
     const morningLink = `${s.morningNotePrefix}${day}`;
-    const section = `
+    const morningHeading = `## Discussion · ${title}`;
+    const morningSection = `
 
 ---
 
-## Discussion · ${title}
+${morningHeading}
 
 **Type**: ${typeLabel}  
 **Briefing**: [[${briefingBase}]]  
@@ -1217,7 +1516,8 @@ ${organized}
 `;
     if (await this.app.vault.adapter.exists(morningPath)) {
       const prev = await this.app.vault.adapter.read(morningPath);
-      await this.app.vault.adapter.write(morningPath, prev.trimEnd() + "\n" + section);
+      const updated = upsertMarkdownSection(prev, morningHeading, morningSection);
+      await this.app.vault.adapter.write(morningPath, updated);
     } else {
       const templateHint = extraLinks ? `\n> Template links: ${extraLinks.replace(/\n/g, " ")}` : "";
       const header = `---
@@ -1233,7 +1533,7 @@ tags:
 
 **Briefing**: [[${briefingBase}]]${templateHint}
 `;
-      await this.app.vault.create(morningPath, header + section);
+      await this.app.vault.create(morningPath, header + morningSection);
     }
 
     if (await this.app.vault.adapter.exists(briefingPath)) {
@@ -1250,7 +1550,24 @@ tags:
     if (await this.app.vault.adapter.exists(logPath)) {
       prev = await this.app.vault.adapter.read(logPath);
     }
-    if (prev.includes(`[[${wikiName}]]`)) {
+
+    const logDayMarker = `Briefing discussion · ${day}`;
+    const logSubHeading = `### ${title}`;
+    const logSubBlock = `
+
+${logSubHeading}
+
+**Type**: ${typeLabel}
+
+| Point | Summary |
+|-------|---------|
+${points}
+
+`;
+
+    if (prev.includes(logDayMarker)) {
+      const updatedLog = upsertMarkdownSection(prev, logSubHeading, logSubBlock);
+      await this.app.vault.adapter.write(logPath, updatedLog);
       return { wiki: wikiPath, morning: morningPath, log: logPath };
     }
 
@@ -1259,9 +1576,9 @@ tags:
 
 ---
 
-# ${n}. Briefing discussion · ${title}
+# ${n}. ${logDayMarker}
 
-**Type**: ${typeLabel}
+**Briefing**: [[${briefingBase}]]
 
 ## Source
 
@@ -1277,13 +1594,7 @@ tags:
 | session | [[${wikiName}]] |
 | briefing | [[${briefingBase}]] |
 | morning | [[${morningLink}]] |
-
-## Key points
-
-| Point | Summary |
-|-------|---------|
-${points}
-
+${logSubBlock}
 ### Review path
 
 - [[${wikiName}]]
@@ -1321,7 +1632,7 @@ class HorizonDiscussSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default model")
-      .setDesc("OpenCode Zen model id, e.g. claude-haiku-4-5")
+      .setDesc("OpenCode Zen model id, e.g. gpt-5.4-mini / gpt-5.4 / deepseek-v4-flash")
       .addText((t) =>
         t.setValue(s.model).onChange(async (v) => {
           this.plugin.settings.model = (v || OPENCODE_DEFAULT_MODEL).trim();
@@ -1335,6 +1646,39 @@ class HorizonDiscussSettingTab extends PluginSettingTab {
       .addText((t) =>
         t.setValue(s.visionModel).onChange(async (v) => {
           this.plugin.settings.visionModel = (v || OPENCODE_VISION_MODEL).trim();
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl("h3", { text: "Agent Reach (web fetch)" });
+
+    new Setting(containerEl)
+      .setName("Agent Reach Python")
+      .setDesc("Python from agent-reach venv, e.g. ~/.agent-reach-venv/Scripts/python.exe")
+      .addText((t) =>
+        t.setValue(s.agentReachPython || "").onChange(async (v) => {
+          this.plugin.settings.agentReachPython = v.trim();
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-fetch URLs in message")
+      .setDesc("When sending, auto-fetch links via Agent Reach (max 3 per message)")
+      .addToggle((toggle) =>
+        toggle.setValue(!!s.autoFetchUrls).onChange(async (v) => {
+          this.plugin.settings.autoFetchUrls = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Max web content chars")
+      .setDesc("Truncate fetched page text before sending to the model")
+      .addText((t) =>
+        t.setValue(String(s.maxWebChars || MAX_WEB_CHARS)).onChange(async (v) => {
+          const n = parseInt(v, 10);
+          this.plugin.settings.maxWebChars = Number.isNaN(n) ? MAX_WEB_CHARS : n;
           await this.plugin.saveSettings();
         })
       );

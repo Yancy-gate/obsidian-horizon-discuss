@@ -11,7 +11,7 @@ Discuss daily briefing notes inside Obsidian with an AI assistant, then **ingest
 - **Vision**: paste screenshots (Ctrl+V) or drag images into the panel.
 - **Attachments**: drag text files (`.md`, `.py`, …) into context.
 - **Markdown rendering** for assistant replies.
-- **Ingest** checked messages → morning review note + `wiki/sessions` entry + numbered daily study log.
+- **Ingest** checked messages → one daily morning note + one wiki session + one study log entry (multiple ingests append sections, no duplicate pages).
 - Import recent **Copilot** conversation exports (optional).
 - Configurable vault paths, filename prefixes, review wikilinks, and AI focus topics.
 
