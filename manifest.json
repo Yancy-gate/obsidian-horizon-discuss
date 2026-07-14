@@ -1,9 +1,9 @@
 {
   "id": "horizon-discuss",
   "name": "Horizon Discuss",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "minAppVersion": "1.5.0",
-  "description": "Discuss daily briefings with AI. No default model — configure in settings. Agent Reach web fetch. One wiki/morning/log per day.",
+  "description": "Discuss daily briefings with AI. OpenCode Zen gpt-* uses /v1/responses. Agent Reach web fetch. One wiki/morning/log per day.",
   "author": "Yancy-gate",
   "authorUrl": "https://github.com/Yancy-gate",
   "isDesktopOnly": true

@@ -150,3 +150,10 @@ zip 内已含 `main.js`、`manifest.json`、`styles.css`、`agent-reach-fetch.py
 ## 许可
 
 MIT — 见 [LICENSE](LICENSE)。
+
+## 更新日志
+
+### 0.6.3
+- 修复：gpt-* 模型走 OpenCode Zen /v1/responses（此前误用 /chat/completions 导致聊天失败 400）
+- 识图与 GPT Responses API 对齐
+

@@ -1160,29 +1160,142 @@ function parseCopilotConversation(text) {
   return out;
 }
 
+/**
+ * OpenCode Zen 按模型走不同端点：
+ * - gpt-* / *codex* → /v1/responses（OpenAI Responses）
+ * - 其余兼容模型 → /v1/chat/completions
+ * 之前对 gpt-5.4-mini 误打 chat/completions，会返回怪异的 400 + 空 assistant。
+ */
+function zenApiStyle(model, provider) {
+  if (provider && provider !== "opencode-zen") return "chat";
+  const m = String(model || "").toLowerCase();
+  if (m.startsWith("gpt-") || m.includes("codex")) return "responses";
+  return "chat";
+}
+
+function chatContentToResponsesParts(content, role) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content || "");
+
+  const parts = [];
+  for (const p of content) {
+    if (!p || typeof p !== "object") continue;
+    if (p.type === "text" && p.text != null) {
+      parts.push({
+        type: role === "assistant" ? "output_text" : "input_text",
+        text: String(p.text),
+      });
+    } else if (p.type === "image_url") {
+      const url = typeof p.image_url === "string" ? p.image_url : p.image_url?.url;
+      if (url) parts.push({ type: "input_image", image_url: url });
+    }
+  }
+  return parts.length ? parts : "";
+}
+
+function buildResponsesBody(model, messages, maxTokens) {
+  let instructions = "";
+  const input = [];
+  for (const m of messages || []) {
+    if (!m) continue;
+    if (m.role === "system") {
+      const c = m.content;
+      instructions += (instructions ? "\n\n" : "") + (typeof c === "string" ? c : JSON.stringify(c));
+      continue;
+    }
+    const role = m.role === "assistant" ? "assistant" : "user";
+    input.push({
+      role,
+      content: chatContentToResponsesParts(m.content, role),
+    });
+  }
+  const body = {
+    model,
+    input,
+    max_output_tokens: maxTokens || 2048,
+  };
+  if (instructions) body.instructions = instructions;
+  return body;
+}
+
+function extractResponsesText(data) {
+  if (!data || typeof data !== "object") return "";
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+  const parts = [];
+  for (const item of data.output || []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "message") {
+      for (const c of item.content || []) {
+        if (c?.type === "output_text" && c.text) parts.push(c.text);
+      }
+    } else if (item.type === "output_text" && item.text) {
+      parts.push(item.text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function extractChatText(data) {
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) return "";
+  return typeof content === "string" ? content.trim() : JSON.stringify(content);
+}
+
 async function chatCompletion(creds, messages, opts = {}) {
-  const url = `${creds.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const body = JSON.stringify({
-    model: creds.model,
-    messages,
-    temperature: 0.25,
-    max_tokens: opts.maxTokens || 2048,
-  });
+  const style = zenApiStyle(creds.model, creds.provider);
+  const base = creds.baseUrl.replace(/\/$/, "");
+  const maxTokens = opts.maxTokens || 2048;
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${creds.apiKey}`,
   };
 
-  let res = await postJson(url, headers, body);
-  if (res.status < 200 || res.status >= 300) {
-    const errText = String(res.text || res.json || "").slice(0, 300);
-    throw new Error(`${res.status} ${errText}`);
+  let url;
+  let bodyObj;
+  if (style === "responses") {
+    url = `${base}/responses`;
+    bodyObj = buildResponsesBody(creds.model, messages, maxTokens);
+  } else {
+    url = `${base}/chat/completions`;
+    bodyObj = {
+      model: creds.model,
+      messages,
+      temperature: 0.25,
+      max_tokens: maxTokens,
+    };
   }
 
-  const data = res.json;
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("模型返回为空");
-  return typeof content === "string" ? content.trim() : JSON.stringify(content);
+  const body = JSON.stringify(bodyObj);
+  const res = await postJson(url, headers, body);
+  if (res.status < 200 || res.status >= 300) {
+    const errText = String(res.text || JSON.stringify(res.json) || "").slice(0, 400);
+    const hint =
+      style === "responses"
+        ? ""
+        : /gpt-|codex/i.test(creds.model || "")
+          ? "（提示：该 GPT 模型应走 /v1/responses，请升级插件或换 deepseek-v4-flash）"
+          : "";
+    throw new Error(`${res.status} ${errText}${hint}`);
+  }
+
+  const data = res.json || (() => {
+    try {
+      return JSON.parse(res.text || "{}");
+    } catch (e) {
+      return null;
+    }
+  })();
+
+  const content = style === "responses" ? extractResponsesText(data) : extractChatText(data);
+  if (!content) {
+    const status = data?.status || data?.choices?.[0]?.finish_reason || "";
+    throw new Error(
+      `模型返回为空${status ? `（${status}）` : ""}。可尝试换模型，或增大生成长度。`
+    );
+  }
+  return content;
 }
 
 async function postJson(url, headers, body) {
@@ -1645,7 +1758,7 @@ class HorizonDiscussSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Default model")
-      .setDesc("Required. OpenCode Zen model id (run `agent-reach` / OpenCode docs for available ids).")
+      .setDesc("Required. Zen model id，如 gpt-5.4-mini（自动走 /v1/responses）或 deepseek-v4-flash。")
       .addText((t) =>
         t.setValue(s.model || "").onChange(async (v) => {
           this.plugin.settings.model = (v || "").trim();
@@ -1655,7 +1768,7 @@ class HorizonDiscussSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Vision model")
-      .setDesc("Optional. Used when images are attached; falls back to Default model if empty.")
+      .setDesc("Optional. 发图时使用；留空则用 Default。gpt-5.4-mini 支持识图。")
       .addText((t) =>
         t.setValue(s.visionModel || "").onChange(async (v) => {
           this.plugin.settings.visionModel = (v || "").trim();
