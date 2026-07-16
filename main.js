@@ -253,29 +253,20 @@ function escapeHdKey(title) {
 }
 
 /** 用 HTML 注释包裹章节，避免正文里的 ## 把 upsert 截断 */
-function wrapHdSection(key, inner) {
-  const k = escapeHdKey(key);
-  return `\n\n<!--hd:${k}-->\n${String(inner || "").trim()}\n<!--/hd:${k}-->\n`;
+function stripHdMarkers(text) {
+  return String(text || "")
+    .replace(/\n?<!--\/?hd:[^>]*-->\n?/g, "\n")
+    .replace(/\n{3,}/g, "\n\n");
 }
 
-function upsertHdSection(text, key, inner) {
-  const body = text || "";
-  const k = escapeHdKey(key);
-  const start = `<!--hd:${k}-->`;
-  const end = `<!--/hd:${k}-->`;
-  const block = wrapHdSection(k, inner);
-  const startIdx = body.indexOf(start);
-  if (startIdx === -1) return body.trimEnd() + block;
-  const endIdx = body.indexOf(end, startIdx);
-  if (endIdx === -1) {
-    // 旧格式无结束标记：从 start 起替换到下一个同级 hd 标记或文末
-    const rest = body.slice(startIdx + start.length);
-    const next = rest.search(/\n<!--hd:/);
-    const before = body.slice(0, startIdx);
-    const after = next === -1 ? "" : rest.slice(next);
-    return before.trimEnd() + block + after;
-  }
-  return body.slice(0, startIdx).trimEnd() + block + body.slice(endIdx + end.length);
+/**
+ * 按同级标题替换/追加章节（卡片正文只用 ###，因此 ## / ### 分界安全）
+ */
+function upsertByHeading(text, heading, newBlock) {
+  const body = stripHdMarkers(text || "");
+  const block = `\n\n${String(newBlock || "").trim()}\n`;
+  if (!body.includes(heading)) return body.trimEnd() + block;
+  return replaceMarkdownSection(body, heading, block);
 }
 
 /**
@@ -2057,26 +2048,28 @@ ${relatedYaml}
 `;
     }
 
+    wikiBody = stripHdMarkers(wikiBody);
     for (const card of cardList) {
       const title = card.title || this.extractTitle(card.markdown);
       const bodyMd = normalizeCardMarkdown(card.markdown, title);
-      const wikiInner = `## ${title}
+      const wikiHeading = `## ${title}`;
+      const wikiInner = `${wikiHeading}
 
 **Type**: ${typeLabel} · **Briefing**: [[${briefingBase}]]
 
 ${bodyMd}`;
-      wikiBody = upsertHdSection(wikiBody, `wiki:${title}`, wikiInner);
+      wikiBody = upsertByHeading(wikiBody, wikiHeading, wikiInner);
     }
-    // 默认不写聊天原文附录：入库正文必须是整理后的理解卡
-    // 若已有旧版「完整讨论附录」章节，入库时移除，避免再次堆原文
+    // 清掉旧版聊天附录（含 hd 标记或裸标题）
     wikiBody = wikiBody.replace(
       /\n*<!--hd:wiki:__appendix__-->[\s\S]*?<!--\/hd:wiki:__appendix__-->\n*/g,
       "\n"
     );
+    wikiBody = wikiBody.replace(/\n## 完整讨论附录[\s\S]*?(?=\n## |\n*$)/, "\n");
     if (await this.app.vault.adapter.exists(wikiPath)) {
-      await this.app.vault.adapter.write(wikiPath, wikiBody);
+      await this.app.vault.adapter.write(wikiPath, wikiBody.trim() + "\n");
     } else {
-      await this.app.vault.create(wikiPath, wikiBody);
+      await this.app.vault.create(wikiPath, wikiBody.trim() + "\n");
     }
 
     // —— 晨读 ——
@@ -2099,12 +2092,14 @@ tags:
 **Briefing**: [[${briefingBase}]]${templateHint}
 `;
     }
+    morningBody = stripHdMarkers(morningBody);
     for (const card of cardList) {
       const title = card.title || this.extractTitle(card.markdown);
       const bodyMd = normalizeCardMarkdown(card.markdown, title);
+      const morningHeading = `## Discussion · ${title}`;
       const morningInner = `---
 
-## Discussion · ${title}
+${morningHeading}
 
 **Type**: ${typeLabel}  
 **Briefing**: [[${briefingBase}]]  
@@ -2112,12 +2107,12 @@ tags:
 
 ${bodyMd}
 `;
-      morningBody = upsertHdSection(morningBody, `morning:${title}`, morningInner);
+      morningBody = upsertByHeading(morningBody, morningHeading, morningInner);
     }
     if (await this.app.vault.adapter.exists(morningPath)) {
-      await this.app.vault.adapter.write(morningPath, morningBody);
+      await this.app.vault.adapter.write(morningPath, morningBody.trim() + "\n");
     } else {
-      await this.app.vault.create(morningPath, morningBody);
+      await this.app.vault.create(morningPath, morningBody.trim() + "\n");
     }
 
     if (await this.app.vault.adapter.exists(briefingPath)) {
@@ -2180,39 +2175,29 @@ ${s.dailyLogIntro}` + logEntry;
       const title = card.title || this.extractTitle(card.markdown);
       const points = extractKeyPointsTable(card.markdown);
       const logSubHeading = `### ${title}`;
-      const logSubBlock = `
-
-${logSubHeading}
+      const logSubBlock = `${logSubHeading}
 
 **Type**: ${typeLabel}
 
 | Point | Summary |
 |-------|---------|
 ${points}
-
 `;
-      // 插到 Review path 之前；若已有同标题则用 hd 标记更新
-      if (logBody.includes(`<!--hd:log:${escapeHdKey(title)}-->`)) {
-        logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
-      } else if (logBody.includes(logSubHeading)) {
-        logBody = upsertMarkdownSection(logBody, logSubHeading, logSubBlock);
+      logBody = stripHdMarkers(logBody);
+      if (logBody.includes(logSubHeading)) {
+        logBody = upsertByHeading(logBody, logSubHeading, logSubBlock);
       } else {
-        const reviewIdx = logBody.indexOf("### Review path");
-        if (reviewIdx !== -1 && logBody.includes(logDayMarker)) {
-          // 插在当日条目的 Review path 前
-          const dayIdx = logBody.indexOf(logDayMarker);
-          const reviewInDay = logBody.indexOf("### Review path", dayIdx);
-          if (reviewInDay !== -1) {
-            logBody =
-              logBody.slice(0, reviewInDay).trimEnd() +
-              wrapHdSection(`log:${title}`, logSubBlock) +
-              "\n" +
-              logBody.slice(reviewInDay);
-          } else {
-            logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
-          }
+        const dayIdx = logBody.indexOf(logDayMarker);
+        const reviewInDay = dayIdx === -1 ? -1 : logBody.indexOf("### Review path", dayIdx);
+        if (reviewInDay !== -1) {
+          logBody =
+            logBody.slice(0, reviewInDay).trimEnd() +
+            "\n\n" +
+            logSubBlock.trim() +
+            "\n\n" +
+            logBody.slice(reviewInDay);
         } else {
-          logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
+          logBody = upsertByHeading(logBody, logSubHeading, logSubBlock);
         }
       }
     }
