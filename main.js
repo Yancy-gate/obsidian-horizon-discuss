@@ -209,7 +209,7 @@ function extractKeyPointsTable(organized) {
     if (bullets.length >= 5) break;
   }
   if (!bullets.length) {
-    const understand = organized.match(/##\s*我的理解\s*\n([\s\S]*?)(?=\n##\s|$)/);
+    const understand = organized.match(/#{2,3}\s*我的理解\s*\n([\s\S]*?)(?=\n#{2,3}\s|$)/);
     if (understand) {
       const t = understand[1].replace(/\s+/g, " ").trim().slice(0, 120);
       if (t) bullets.push(t);
@@ -219,12 +219,49 @@ function extractKeyPointsTable(organized) {
   return bullets.map((b, i) => `| ${i === 0 ? "Point" : "Extra"}${i + 1} | ${b.slice(0, 80)} |`).join("\n");
 }
 
+function escapeHdKey(title) {
+  return String(title || "")
+    .replace(/-->/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+/** 用 HTML 注释包裹章节，避免正文里的 ## 把 upsert 截断 */
+function wrapHdSection(key, inner) {
+  const k = escapeHdKey(key);
+  return `\n\n<!--hd:${k}-->\n${String(inner || "").trim()}\n<!--/hd:${k}-->\n`;
+}
+
+function upsertHdSection(text, key, inner) {
+  const body = text || "";
+  const k = escapeHdKey(key);
+  const start = `<!--hd:${k}-->`;
+  const end = `<!--/hd:${k}-->`;
+  const block = wrapHdSection(k, inner);
+  const startIdx = body.indexOf(start);
+  if (startIdx === -1) return body.trimEnd() + block;
+  const endIdx = body.indexOf(end, startIdx);
+  if (endIdx === -1) {
+    // 旧格式无结束标记：从 start 起替换到下一个同级 hd 标记或文末
+    const rest = body.slice(startIdx + start.length);
+    const next = rest.search(/\n<!--hd:/);
+    const before = body.slice(0, startIdx);
+    const after = next === -1 ? "" : rest.slice(next);
+    return before.trimEnd() + block + after;
+  }
+  return body.slice(0, startIdx).trimEnd() + block + body.slice(endIdx + end.length);
+}
+
 function replaceMarkdownSection(text, heading, newBlock) {
   const body = text || "";
   const idx = body.indexOf(heading);
   if (idx === -1) return body.trimEnd() + newBlock;
+  const levelMatch = heading.match(/^(#+)\s/);
+  const level = levelMatch ? levelMatch[1].length : 2;
   const after = body.slice(idx + heading.length);
-  const nextIdx = after.search(/\n## /);
+  // 只在同级或更高级标题处结束，避免被正文 ### / 更深标题误切；仍可能被同级 ## 误切，优先用 upsertHdSection
+  const nextIdx = after.search(new RegExp(`\\n#{1,${level}}\\s`));
   const tail = nextIdx === -1 ? "" : after.slice(nextIdx);
   return body.slice(0, idx) + newBlock.trimEnd() + tail;
 }
@@ -233,6 +270,51 @@ function upsertMarkdownSection(text, heading, newBlock) {
   const body = text || "";
   if (body.includes(heading)) return replaceMarkdownSection(body, heading, newBlock);
   return body.trimEnd() + newBlock;
+}
+
+/** 把模型输出拆成多张入库卡（多话题） */
+function parseIngestCards(organized) {
+  const raw = String(organized || "").trim();
+  if (!raw) return [];
+
+  const bySep = raw
+    .split(/\n\s*---CARD---\s*\n/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (bySep.length > 1) {
+    return bySep.map((md) => ({
+      title: (md.match(/^#\s+(.+)$/m) || [, "讨论沉淀"])[1].trim().replace(/[\\/:*?"<>|]/g, "").slice(0, 40),
+      markdown: md,
+    }));
+  }
+
+  // 多个顶级 # 标题 → 多卡
+  const lines = raw.split("\n");
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#\s+\S/.test(lines[i]) && !/^##/.test(lines[i])) starts.push(i);
+  }
+  if (starts.length > 1) {
+    const cards = [];
+    for (let i = 0; i < starts.length; i++) {
+      const from = starts[i];
+      const to = i + 1 < starts.length ? starts[i + 1] : lines.length;
+      const md = lines.slice(from, to).join("\n").trim();
+      if (!md) continue;
+      cards.push({
+        title: (md.match(/^#\s+(.+)$/m) || [, "讨论沉淀"])[1].trim().replace(/[\\/:*?"<>|]/g, "").slice(0, 40),
+        markdown: md,
+      });
+    }
+    if (cards.length) return cards;
+  }
+
+  return [
+    {
+      title: (raw.match(/^#\s+(.+)$/m) || [, "讨论沉淀"])[1].trim().replace(/[\\/:*?"<>|]/g, "").slice(0, 40),
+      markdown: raw,
+    },
+  ];
 }
 
 function readOpenCodeZenKey() {
@@ -1054,35 +1136,43 @@ class HorizonDiscussView extends ItemView {
         .join("\n\n---\n\n");
 
       const focus = this.plugin.settings.focusTopics || DEFAULT_SETTINGS.focusTopics;
-      const prompt = `你是 Obsidian 知识库整理助手。根据「今日内参摘录」和「用户勾选的讨论」，输出一份可直接入库的中文笔记。
+      const turnCount = selected.length;
+      const prompt = `你是 Obsidian 知识库整理助手。根据「今日内参摘录」和「用户勾选的全部讨论」，整理成可入库的中文笔记。
 
-要求：
-1. 只输出 Markdown，不要代码围栏包裹全文
-2. 结构必须包含以下标题：
-# （简洁标题，≤20字）
-## 来源
-## 发生了什么
-## 我的理解
-## 未决问题
-## 下一步
-3. 「我的理解」优先保留用户原话与判断，不要空话；全文偏短、利于复习
-4. 「下一步」用 - [ ] 清单，最多 5 条
-5. 类型提示：这是「${typeLabel}」
-6. 若与用户关注领域（${focus}）相关，在理解里点明连接
-7. 若讨论涉及图片，在「发生了什么/我的理解」里概括图中关键信息（不要编造看不见的细节）
+硬性要求：
+1. 只输出 Markdown，不要用代码围栏包裹全文
+2. **必须覆盖勾选讨论里的每一个用户问题/主题**，不得只留一条、不得把后半段丢掉
+3. 若讨论有多个不同主题（例如：概念解释、机制拆解、横向对比、行业信号、行动项），输出**多张卡片**
+4. 多张卡片之间用单独一行分隔符：
+---CARD---
+5. 每张卡片结构固定为：
+# （该话题简洁标题，≤20字）
+### 来源
+### 发生了什么
+### 我的理解
+### 未决问题
+### 下一步
+6. 「我的理解」优先保留用户原话与判断；要点要全，但避免空话套话
+7. 「下一步」用 - [ ] 清单，每卡最多 5 条
+8. 类型提示：这是「${typeLabel}」；关注领域：${focus}
+9. 涉及图片时概括可见信息，不臆造
+10. 当前勾选共 ${turnCount} 条消息；若主题≥2，必须输出≥2 张卡片
 
 今日内参路径：${this.briefingPath}
 
 内参摘录：
-${this.briefingExcerpt.slice(0, 8000)}
+${this.briefingExcerpt.slice(0, 12000)}
 
-勾选的讨论：
-${discussText.slice(0, 10000)}
+勾选的讨论（全文，请全部纳入整理）：
+${discussText}
 `;
 
-      // 入库整理：把最近带图用户消息一并送给模型，便于保留识图结论
       const ingestMessages = [
-        { role: "system", content: "你输出干净的 Markdown 笔记，服从用户结构要求。" },
+        {
+          role: "system",
+          content:
+            "你输出干净的 Markdown 笔记。多主题时必须输出多张卡片，用 ---CARD--- 分隔。禁止只总结成一张而丢掉后半讨论。",
+        },
       ];
       const lastImgMsg = [...selected].reverse().find((m) => m.role === "user" && m.images?.length);
       if (lastImgMsg) {
@@ -1100,18 +1190,20 @@ ${discussText.slice(0, 10000)}
         ingestMessages.push({ role: "user", content: prompt });
       }
 
-      const organized = await chatCompletion(creds, ingestMessages, { maxTokens: 3000 });
+      const organized = await chatCompletion(creds, ingestMessages, { maxTokens: 8000 });
+      const cards = parseIngestCards(organized);
+      if (!cards.length) throw new Error("整理结果为空");
 
       const paths = await this.plugin.writeIngestResults({
-        organized,
+        cards,
         type,
         typeLabel,
         briefingPath: this.briefingPath,
         discussText,
       });
 
-      this.setStatus(`已入库：${paths.wiki}`);
-      new Notice(`已追加到今日 wiki / 晨读 / 学习日志`);
+      this.setStatus(`已入库 ${cards.length} 个话题 → ${paths.wiki}`);
+      new Notice(`已入库 ${cards.length} 个话题到今日 wiki / 晨读 / 学习日志`);
     } catch (e) {
       console.error(e);
       this.setStatus("入库失败");
@@ -1555,52 +1647,41 @@ class HorizonDiscussPlugin extends Plugin {
     return (m ? m[1] : "Briefing discussion").trim().replace(/[\\/:*?"<>|]/g, "").slice(0, 40);
   }
 
-  async writeIngestResults({ organized, type, typeLabel, briefingPath, discussText }) {
+  async writeIngestResults({ cards, organized, type, typeLabel, briefingPath, discussText }) {
     const s = resolveSettings(this.settings);
     const day = todayStr();
-    const title = this.extractTitle(organized);
+    const cardList =
+      Array.isArray(cards) && cards.length
+        ? cards
+        : parseIngestCards(organized || "");
+    if (!cardList.length) throw new Error("没有可写入的整理卡片");
+
     const briefingBase = briefingPath.split("/").pop().replace(/\.md$/, "");
     const extraLinks = reviewLinkLines(s);
-    const relatedYaml = extraLinks
-      ? extraLinks
-          .replace(/^- \[\[/g, "")
-          .replace(/\]\]$/gm, "")
-          .split("\n")
-          .map((l) => `  - "[[${l.trim()}]]"`)
-          .join("\n")
-      : "";
+    const relatedYaml = String(s.reviewLinks || "")
+      .split(/[,，\n]/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .map((l) => `  - "[[${l}]]"`)
+      .join("\n");
 
     await this.ensureFolder(s.briefingDir);
     await this.ensureFolder(s.wikiSessionsDir);
     await this.ensureFolder(s.dailyLogDir);
 
-    // 同一天共用一个 wiki session 页面（多次入库追加章节，同标题则更新）
     const wikiName = `${s.sessionNamePrefix}-${day}`;
     const wikiPath = `${s.wikiSessionsDir}/${wikiName}.md`;
-    const wikiSectionHeading = `## ${title}`;
-    const wikiSection = `
+    const morningPath = `${s.briefingDir}/${s.morningNotePrefix}${day}.md`;
+    const morningLink = `${s.morningNotePrefix}${day}`;
+    const logPath = `${s.dailyLogDir}/${day}.md`;
 
-${wikiSectionHeading}
-
-**Type**: ${typeLabel} · **Briefing**: [[${briefingBase}]]
-
-${organized}
-
-<details>
-<summary>Discussion appendix · ${title}</summary>
-
-${truncate(discussText, 8000)}
-
-</details>
-`;
-
+    // —— Wiki：一天一页，多话题多章节 ——
+    let wikiBody = "";
     if (await this.app.vault.adapter.exists(wikiPath)) {
-      const prevWiki = await this.app.vault.adapter.read(wikiPath);
-      const updatedWiki = upsertMarkdownSection(prevWiki, wikiSectionHeading, wikiSection);
-      const withDate = updatedWiki.replace(/^updated: .+$/m, `updated: ${day}`);
-      await this.app.vault.adapter.write(wikiPath, withDate);
+      wikiBody = await this.app.vault.adapter.read(wikiPath);
+      wikiBody = wikiBody.replace(/^updated: .+$/m, `updated: ${day}`);
     } else {
-      const wikiBody = `---
+      wikiBody = `---
 type: session
 title: "${s.sessionNamePrefix} ${day}"
 source: "[[${briefingBase}]]"
@@ -1619,34 +1700,38 @@ ${relatedYaml}
 # ${s.sessionNamePrefix} · ${day}
 
 **Briefing**: [[${briefingBase}]]
-${wikiSection}
 `;
+    }
+
+    for (const card of cardList) {
+      const title = card.title || this.extractTitle(card.markdown);
+      const wikiInner = `## ${title}
+
+**Type**: ${typeLabel} · **Briefing**: [[${briefingBase}]]
+
+${card.markdown}
+
+<details>
+<summary>Discussion appendix · ${title}</summary>
+
+${truncate(discussText, 50000)}
+
+</details>`;
+      wikiBody = upsertHdSection(wikiBody, `wiki:${title}`, wikiInner);
+    }
+    if (await this.app.vault.adapter.exists(wikiPath)) {
+      await this.app.vault.adapter.write(wikiPath, wikiBody);
+    } else {
       await this.app.vault.create(wikiPath, wikiBody);
     }
 
-    const morningPath = `${s.briefingDir}/${s.morningNotePrefix}${day}.md`;
-    const morningLink = `${s.morningNotePrefix}${day}`;
-    const morningHeading = `## Discussion · ${title}`;
-    const morningSection = `
-
----
-
-${morningHeading}
-
-**Type**: ${typeLabel}  
-**Briefing**: [[${briefingBase}]]  
-**Wiki**: [[${wikiName}]]
-
-${organized}
-
-`;
+    // —— 晨读 ——
+    let morningBody = "";
     if (await this.app.vault.adapter.exists(morningPath)) {
-      const prev = await this.app.vault.adapter.read(morningPath);
-      const updated = upsertMarkdownSection(prev, morningHeading, morningSection);
-      await this.app.vault.adapter.write(morningPath, updated);
+      morningBody = await this.app.vault.adapter.read(morningPath);
     } else {
       const templateHint = extraLinks ? `\n> Template links: ${extraLinks.replace(/\n/g, " ")}` : "";
-      const header = `---
+      morningBody = `---
 type: daily-briefing-review
 date: ${day}
 briefing: "[[${briefingBase}]]"
@@ -1659,7 +1744,25 @@ tags:
 
 **Briefing**: [[${briefingBase}]]${templateHint}
 `;
-      await this.app.vault.create(morningPath, header + morningSection);
+    }
+    for (const card of cardList) {
+      const title = card.title || this.extractTitle(card.markdown);
+      const morningInner = `---
+
+## Discussion · ${title}
+
+**Type**: ${typeLabel}  
+**Briefing**: [[${briefingBase}]]  
+**Wiki**: [[${wikiName}]]
+
+${card.markdown}
+`;
+      morningBody = upsertHdSection(morningBody, `morning:${title}`, morningInner);
+    }
+    if (await this.app.vault.adapter.exists(morningPath)) {
+      await this.app.vault.adapter.write(morningPath, morningBody);
+    } else {
+      await this.app.vault.create(morningPath, morningBody);
     }
 
     if (await this.app.vault.adapter.exists(briefingPath)) {
@@ -1670,35 +1773,17 @@ tags:
       }
     }
 
-    const logPath = `${s.dailyLogDir}/${day}.md`;
-    const points = extractKeyPointsTable(organized);
+    // —— 每日学习日志：一天一条大条目，多话题用 ### ——
     let prev = "";
     if (await this.app.vault.adapter.exists(logPath)) {
       prev = await this.app.vault.adapter.read(logPath);
     }
 
     const logDayMarker = `Briefing discussion · ${day}`;
-    const logSubHeading = `### ${title}`;
-    const logSubBlock = `
-
-${logSubHeading}
-
-**Type**: ${typeLabel}
-
-| Point | Summary |
-|-------|---------|
-${points}
-
-`;
-
-    if (prev.includes(logDayMarker)) {
-      const updatedLog = upsertMarkdownSection(prev, logSubHeading, logSubBlock);
-      await this.app.vault.adapter.write(logPath, updatedLog);
-      return { wiki: wikiPath, morning: morningPath, log: logPath };
-    }
-
-    const n = nextDailyEntryNumber(prev);
-    const logEntry = `
+    let logBody = prev;
+    if (!logBody.includes(logDayMarker)) {
+      const n = nextDailyEntryNumber(logBody);
+      const logEntry = `
 
 ---
 
@@ -1720,24 +1805,70 @@ ${points}
 | session | [[${wikiName}]] |
 | briefing | [[${briefingBase}]] |
 | morning | [[${morningLink}]] |
-${logSubBlock}
+
 ### Review path
 
 - [[${wikiName}]]
 - [[${briefingBase}]]
 ${extraLinks}
 `;
+      if (logBody) {
+        logBody = logBody.trimEnd() + "\n" + logEntry;
+      } else {
+        logBody = `# ${day} study log
 
-    if (prev) {
-      await this.app.vault.adapter.write(logPath, prev.trimEnd() + "\n" + logEntry);
-    } else {
-      const header = `# ${day} study log
-
-${s.dailyLogIntro}`;
-      await this.app.vault.create(logPath, header + logEntry);
+${s.dailyLogIntro}` + logEntry;
+      }
     }
 
-    return { wiki: wikiPath, morning: morningPath, log: logPath };
+    for (const card of cardList) {
+      const title = card.title || this.extractTitle(card.markdown);
+      const points = extractKeyPointsTable(card.markdown);
+      const logSubHeading = `### ${title}`;
+      const logSubBlock = `
+
+${logSubHeading}
+
+**Type**: ${typeLabel}
+
+| Point | Summary |
+|-------|---------|
+${points}
+
+`;
+      // 插到 Review path 之前；若已有同标题则用 hd 标记更新
+      if (logBody.includes(`<!--hd:log:${escapeHdKey(title)}-->`)) {
+        logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
+      } else if (logBody.includes(logSubHeading)) {
+        logBody = upsertMarkdownSection(logBody, logSubHeading, logSubBlock);
+      } else {
+        const reviewIdx = logBody.indexOf("### Review path");
+        if (reviewIdx !== -1 && logBody.includes(logDayMarker)) {
+          // 插在当日条目的 Review path 前
+          const dayIdx = logBody.indexOf(logDayMarker);
+          const reviewInDay = logBody.indexOf("### Review path", dayIdx);
+          if (reviewInDay !== -1) {
+            logBody =
+              logBody.slice(0, reviewInDay).trimEnd() +
+              wrapHdSection(`log:${title}`, logSubBlock) +
+              "\n" +
+              logBody.slice(reviewInDay);
+          } else {
+            logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
+          }
+        } else {
+          logBody = upsertHdSection(logBody, `log:${title}`, logSubBlock);
+        }
+      }
+    }
+
+    if (await this.app.vault.adapter.exists(logPath)) {
+      await this.app.vault.adapter.write(logPath, logBody);
+    } else {
+      await this.app.vault.create(logPath, logBody);
+    }
+
+    return { wiki: wikiPath, morning: morningPath, log: logPath, cardCount: cardList.length };
   }
 }
 
