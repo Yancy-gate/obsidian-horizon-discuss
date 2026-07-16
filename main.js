@@ -23,6 +23,9 @@ const MAX_WEB_CHARS = 15000;
 const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/gi;
 const MAX_IMAGE_SIDE = 1280;
 const IMAGE_JPEG_QUALITY = 0.85;
+const CHAT_SESSION_REL = ".obsidian/plugins/horizon-discuss/chat-session.json";
+const CHAT_ASSETS_REL = ".obsidian/plugins/horizon-discuss/chat-assets";
+const CHAT_PERSIST_DEBOUNCE_MS = 500;
 
 // OpenCode Zen API（模型由用户在设置中自行填写，插件不设默认）
 const OPENCODE_ZEN_BASE = "https://opencode.ai/zen/v1";
@@ -30,6 +33,28 @@ const SILICONFLOW_VISION_FALLBACK = [
   "zai-org/GLM-5V-Turbo",
   "Qwen/Qwen3-VL-32B-Instruct",
 ];
+
+function dataUrlToBytes(dataUrl) {
+  const m = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/i);
+  if (!m) return null;
+  const mime = m[1];
+  const binary = atob(m[2]);
+  const bin = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bin[i] = binary.charCodeAt(i);
+  const ext =
+    /png/i.test(mime) ? "png" : /webp/i.test(mime) ? "webp" : /gif/i.test(mime) ? "gif" : "jpg";
+  return { mime, bin, ext };
+}
+
+function bytesToDataUrl(mime, bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < u8.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return `data:${mime || "image/jpeg"};base64,${btoa(binary)}`;
+}
 
 const DEFAULT_SETTINGS = {
   provider: "opencode-zen",
@@ -484,6 +509,8 @@ class HorizonDiscussView extends ItemView {
     this.typeEl = null;
     this.pendingEl = null;
     this.composerEl = null;
+    this._persistTimer = null;
+    this._persistBusy = false;
   }
 
   getViewType() {
@@ -541,6 +568,7 @@ class HorizonDiscussView extends ItemView {
     ]) {
       this.typeEl.createEl("option", { text: t, value: v });
     }
+    this.typeEl.addEventListener("change", () => this.schedulePersist());
 
     this.listEl = root.createDiv({ cls: "hd-messages" });
 
@@ -562,6 +590,7 @@ class HorizonDiscussView extends ItemView {
       }
     });
     this.inputEl.addEventListener("paste", (e) => this.handlePaste(e));
+    this.inputEl.addEventListener("input", () => this.schedulePersist());
 
     for (const el of [composer, this.inputEl]) {
       el.addEventListener("dragover", (e) => this.handleDragOver(e));
@@ -579,19 +608,102 @@ class HorizonDiscussView extends ItemView {
     const ingestBtn = actions.createEl("button", { text: "整理入库 → 晨读+Wiki", cls: "mod-cta" });
     ingestBtn.onclick = () => this.ingestSelected();
     const clearChat = actions.createEl("button", { text: "清空对话" });
-    clearChat.onclick = () => {
+    clearChat.onclick = async () => {
       this.messages = [];
       this.pendingImages = [];
       this.pendingFiles = [];
       this.pendingWebPages = [];
+      if (this.inputEl) this.inputEl.value = "";
       this.renderPending();
-      this.renderMessages();
+      await this.renderMessages();
+      await this.plugin.clearChatSession();
+      this.setStatus("已清空对话（本地缓存已删除）");
+      new Notice("对话已清空");
     };
 
     this.statusEl = root.createDiv({ cls: "hd-status" });
-    await this.bindTodayBriefing(true);
+    await this.restoreChatSession();
     this.renderPending();
-    this.renderMessages();
+    await this.renderMessages();
+    if (this.messages.length) {
+      this.setStatus(`已恢复 ${this.messages.length} 条对话`);
+    }
+  }
+
+  async onClose() {
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
+    try {
+      await this.persistChatSession(true);
+    } catch (e) {
+      console.error("persist chat on close failed", e);
+    }
+  }
+
+  schedulePersist() {
+    if (this._persistTimer) clearTimeout(this._persistTimer);
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      this.persistChatSession(false).catch((e) => console.error("persist chat failed", e));
+    }, CHAT_PERSIST_DEBOUNCE_MS);
+  }
+
+  async persistChatSession(immediate = false) {
+    if (this._persistBusy) return;
+    this._persistBusy = true;
+    try {
+      await this.plugin.saveChatSession({
+        version: 1,
+        updatedAt: Date.now(),
+        briefingPath: this.briefingPath || null,
+        ingestType: this.typeEl?.value || "understand",
+        inputDraft: this.inputEl?.value || "",
+        messages: this.messages || [],
+        pendingImages: this.pendingImages || [],
+        pendingFiles: this.pendingFiles || [],
+        pendingWebPages: this.pendingWebPages || [],
+      });
+    } finally {
+      this._persistBusy = false;
+    }
+  }
+
+  async restoreChatSession() {
+    let session = null;
+    try {
+      session = await this.plugin.loadChatSession();
+    } catch (e) {
+      console.error("load chat session failed", e);
+    }
+
+    if (session?.briefingPath) {
+      try {
+        if (await this.app.vault.adapter.exists(session.briefingPath)) {
+          await this.loadBriefing(session.briefingPath);
+        } else {
+          await this.bindTodayBriefing(true);
+        }
+      } catch (e) {
+        await this.bindTodayBriefing(true);
+      }
+    } else {
+      await this.bindTodayBriefing(true);
+    }
+
+    if (!session) return;
+
+    if (session.ingestType && this.typeEl) {
+      this.typeEl.value = session.ingestType;
+    }
+    if (typeof session.inputDraft === "string" && this.inputEl) {
+      this.inputEl.value = session.inputDraft;
+    }
+    this.messages = Array.isArray(session.messages) ? session.messages : [];
+    this.pendingImages = Array.isArray(session.pendingImages) ? session.pendingImages : [];
+    this.pendingFiles = Array.isArray(session.pendingFiles) ? session.pendingFiles : [];
+    this.pendingWebPages = Array.isArray(session.pendingWebPages) ? session.pendingWebPages : [];
   }
 
   setStatus(text) {
@@ -601,7 +713,10 @@ class HorizonDiscussView extends ItemView {
   renderPending() {
     if (!this.pendingEl) return;
     this.pendingEl.empty();
-    if (!this.pendingImages.length && !this.pendingFiles.length && !this.pendingWebPages.length) return;
+    if (!this.pendingImages.length && !this.pendingFiles.length && !this.pendingWebPages.length) {
+      this.schedulePersist();
+      return;
+    }
 
     const parts = [];
     if (this.pendingImages.length) parts.push(`${this.pendingImages.length} 图`);
@@ -651,6 +766,8 @@ class HorizonDiscussView extends ItemView {
         };
       }
     }
+
+    this.schedulePersist();
   }
 
   async promptFetchWebPage() {
@@ -941,6 +1058,7 @@ class HorizonDiscussView extends ItemView {
     const content = await this.app.vault.adapter.read(path);
     this.briefingExcerpt = content.slice(0, 12000);
     this.briefingLabel.setText(`内参：${path}`);
+    this.schedulePersist();
   }
 
   async importCopilotConversation() {
@@ -975,7 +1093,8 @@ class HorizonDiscussView extends ItemView {
           selected: m.role === "assistant" || m.role === "ai" ? true : false,
         });
       }
-      this.renderMessages();
+      await this.renderMessages();
+      this.schedulePersist();
       new Notice(`已导入 ${parsed.length} 条消息（可勾选后入库）`);
     });
     modal.open();
@@ -984,6 +1103,7 @@ class HorizonDiscussView extends ItemView {
   setAllSelected(v) {
     for (const m of this.messages) m.selected = v;
     this.renderMessages();
+    this.schedulePersist();
   }
 
   async renderMessages() {
@@ -1005,6 +1125,7 @@ class HorizonDiscussView extends ItemView {
       cb.onchange = () => {
         m.selected = cb.checked;
         card.toggleClass("selected", m.selected);
+        this.schedulePersist();
       };
       top.createSpan({
         cls: "hd-msg-role",
@@ -1083,6 +1204,7 @@ class HorizonDiscussView extends ItemView {
       selected: true,
     });
     await this.renderMessages();
+    this.schedulePersist();
     this.setStatus(images.length ? "识图思考中…" : webPages.length ? "结合网页思考中…" : "思考中…");
 
     try {
@@ -1096,6 +1218,7 @@ class HorizonDiscussView extends ItemView {
       const reply = await chatCompletion(creds, apiMessages, { maxTokens: 2048 });
       this.messages.push({ id: uid(), role: "assistant", content: reply, images: [], selected: true });
       await this.renderMessages();
+      this.schedulePersist();
       this.setStatus(`就绪 · ${creds.providerLabel} / ${creds.model}`);
     } catch (e) {
       console.error(e);
@@ -1515,6 +1638,194 @@ class HorizonDiscussPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  chatSessionPath() {
+    return CHAT_SESSION_REL;
+  }
+
+  chatAssetsDir() {
+    return CHAT_ASSETS_REL;
+  }
+
+  async ensureChatAssetsDir() {
+    const dir = this.chatAssetsDir();
+    if (!(await this.app.vault.adapter.exists(dir))) {
+      await this.app.vault.adapter.mkdir(dir);
+    }
+  }
+
+  async writeChatImageAsset(dataUrl, preferredName) {
+    const parsed = dataUrlToBytes(dataUrl);
+    if (!parsed) return null;
+    await this.ensureChatAssetsDir();
+    const base = String(preferredName || "img")
+      .replace(/[^\w.\-()+一-龥]/g, "_")
+      .slice(0, 40);
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${base}.${parsed.ext}`;
+    const rel = `${this.chatAssetsDir()}/${fileName}`;
+    await this.app.vault.adapter.writeBinary(rel, parsed.bin);
+    return { asset: fileName, mime: parsed.mime, name: preferredName || fileName };
+  }
+
+  async readChatImageAsset(asset, mime) {
+    const rel = `${this.chatAssetsDir()}/${asset}`;
+    if (!(await this.app.vault.adapter.exists(rel))) return null;
+    const bytes = await this.app.vault.adapter.readBinary(rel);
+    return bytesToDataUrl(mime || "image/jpeg", bytes);
+  }
+
+  async serializeImagesForPersist(images) {
+    const out = [];
+    for (const img of images || []) {
+      if (!img) continue;
+      let asset = img.asset;
+      let mime = img.mime || "image/jpeg";
+      let name = img.name || img.path || "image";
+      if (!asset && img.dataUrl) {
+        const saved = await this.writeChatImageAsset(img.dataUrl, name);
+        if (saved) {
+          asset = saved.asset;
+          mime = saved.mime;
+          name = saved.name;
+        }
+      }
+      const row = { id: img.id || uid(), name, mime, path: img.path || null };
+      if (asset) row.asset = asset;
+      // 不把巨大 dataUrl 写进 JSON；若无 asset 则放弃该图的持久化
+      out.push(row);
+    }
+    return out;
+  }
+
+  async hydrateImages(images) {
+    const out = [];
+    for (const img of images || []) {
+      if (!img) continue;
+      const row = {
+        id: img.id || uid(),
+        name: img.name || "image",
+        mime: img.mime || "image/jpeg",
+        path: img.path || null,
+        asset: img.asset || null,
+        dataUrl: img.dataUrl || null,
+      };
+      if (!row.dataUrl && row.asset) {
+        try {
+          row.dataUrl = await this.readChatImageAsset(row.asset, row.mime);
+        } catch (e) {
+          console.error("hydrate image failed", row.asset, e);
+        }
+      }
+      if (row.dataUrl || row.asset) out.push(row);
+    }
+    return out;
+  }
+
+  async serializeMessagesForPersist(messages) {
+    const out = [];
+    for (const m of messages || []) {
+      out.push({
+        id: m.id || uid(),
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: m.content || "",
+        selected: !!m.selected,
+        images: await this.serializeImagesForPersist(m.images || []),
+        files: (m.files || []).map((f) => ({
+          id: f.id || uid(),
+          name: f.name || f.path || "file",
+          path: f.path || null,
+          text: truncate(f.text || "", MAX_FILE_CHARS),
+        })),
+        webPages: (m.webPages || []).map((w) => ({
+          url: w.url,
+          backend: w.backend || "",
+          text: truncate(w.text || "", MAX_WEB_CHARS),
+        })),
+      });
+    }
+    return out;
+  }
+
+  async hydrateMessages(messages) {
+    const out = [];
+    for (const m of messages || []) {
+      out.push({
+        id: m.id || uid(),
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: m.content || "",
+        selected: !!m.selected,
+        images: await this.hydrateImages(m.images || []),
+        files: Array.isArray(m.files) ? m.files : [],
+        webPages: Array.isArray(m.webPages) ? m.webPages : [],
+      });
+    }
+    return out;
+  }
+
+  async loadChatSession() {
+    const p = this.chatSessionPath();
+    if (!(await this.app.vault.adapter.exists(p))) return null;
+    const raw = await this.app.vault.adapter.read(p);
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object") return null;
+    return {
+      version: data.version || 1,
+      updatedAt: data.updatedAt || 0,
+      briefingPath: data.briefingPath || null,
+      ingestType: data.ingestType || "understand",
+      inputDraft: data.inputDraft || "",
+      messages: await this.hydrateMessages(data.messages || []),
+      pendingImages: await this.hydrateImages(data.pendingImages || []),
+      pendingFiles: Array.isArray(data.pendingFiles) ? data.pendingFiles : [],
+      pendingWebPages: Array.isArray(data.pendingWebPages) ? data.pendingWebPages : [],
+    };
+  }
+
+  async saveChatSession(state) {
+    const payload = {
+      version: 1,
+      updatedAt: Date.now(),
+      briefingPath: state.briefingPath || null,
+      ingestType: state.ingestType || "understand",
+      inputDraft: state.inputDraft || "",
+      messages: await this.serializeMessagesForPersist(state.messages || []),
+      pendingImages: await this.serializeImagesForPersist(state.pendingImages || []),
+      pendingFiles: (state.pendingFiles || []).map((f) => ({
+        id: f.id || uid(),
+        name: f.name || f.path || "file",
+        path: f.path || null,
+        text: truncate(f.text || "", MAX_FILE_CHARS),
+      })),
+      pendingWebPages: (state.pendingWebPages || []).map((w) => ({
+        url: w.url,
+        backend: w.backend || "",
+        text: truncate(w.text || "", MAX_WEB_CHARS),
+      })),
+    };
+    await this.app.vault.adapter.write(this.chatSessionPath(), JSON.stringify(payload, null, 2));
+  }
+
+  async clearChatSession() {
+    const p = this.chatSessionPath();
+    if (await this.app.vault.adapter.exists(p)) {
+      await this.app.vault.adapter.remove(p);
+    }
+    const dir = this.chatAssetsDir();
+    if (await this.app.vault.adapter.exists(dir)) {
+      try {
+        const listing = await this.app.vault.adapter.list(dir);
+        for (const f of listing?.files || []) {
+          try {
+            await this.app.vault.adapter.remove(f);
+          } catch (e) {
+            /* ignore */
+          }
+        }
+      } catch (e) {
+        console.error("clear chat assets failed", e);
+      }
+    }
   }
 
   getAgentReachScriptPath() {
