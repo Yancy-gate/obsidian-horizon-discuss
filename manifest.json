@@ -1,9 +1,9 @@
 {
   "id": "horizon-discuss",
   "name": "Horizon Discuss",
-  "version": "0.6.8",
+  "version": "0.6.9",
   "minAppVersion": "1.5.0",
-  "description": "Discuss daily briefings with AI. Digest cards without HTML markers or raw chat appendix.",
+  "description": "Multi-topic ingest: one daily-log entry per card; per-question fallback when model merges topics.",
   "author": "Yancy-gate",
   "authorUrl": "https://github.com/Yancy-gate",
   "isDesktopOnly": true
