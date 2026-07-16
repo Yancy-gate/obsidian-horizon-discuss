@@ -278,6 +278,47 @@ function upsertHdSection(text, key, inner) {
   return body.slice(0, startIdx).trimEnd() + block + body.slice(endIdx + end.length);
 }
 
+/**
+ * 把 Markdown 标题降成普通行，避免附录/正文里的 # ## 污染 Obsidian 大纲与折叠，
+ * 导致「过一会儿只剩第一条」的错觉或错误折叠。
+ */
+function flattenMdHeadings(md) {
+  return String(md || "").replace(/^#{1,6}\s+(.+)$/gm, (_, title) => `【${String(title).trim()}】`);
+}
+
+/** 卡片正文：去掉重复一级标题，结构小节用 ###，其余标题全部压平 */
+function normalizeCardMarkdown(md, title) {
+  let text = String(md || "").trim();
+  if (!text) return "";
+  // 去掉与章节同名的开头 # 标题
+  if (title) {
+    const re = new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n+`, "i");
+    text = text.replace(re, "");
+  }
+  text = text.replace(/^#\s+(.+)$/m, "【$1】");
+  // ## 结构节 → ###
+  text = text.replace(/^##\s+(来源|发生了什么|我的理解|未决问题|下一步)\s*$/gm, "### $1");
+  // 其余 ## / #### 等压平，避免再冒出大纲项
+  text = text.replace(/^##(?!#)\s+(.+)$/gm, "【$1】");
+  text = text.replace(/^####+\s+(.+)$/gm, "【$1】");
+  // 去掉与章节同名的【标题】占位行
+  if (title) {
+    const re2 = new RegExp(`^【${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}】\\s*\\n+`, "i");
+    text = text.replace(re2, "");
+  }
+  return text.trim();
+}
+
+function buildAppendixBlock(discussText) {
+  const body = flattenMdHeadings(truncate(discussText || "", 50000));
+  return `<details>
+<summary>完整讨论附录（标题已降级，不影响大纲）</summary>
+
+${body}
+
+</details>`;
+}
+
 function replaceMarkdownSection(text, heading, newBlock) {
   const body = text || "";
   const idx = body.indexOf(heading);
@@ -2016,19 +2057,19 @@ ${relatedYaml}
 
     for (const card of cardList) {
       const title = card.title || this.extractTitle(card.markdown);
+      const bodyMd = normalizeCardMarkdown(card.markdown, title);
       const wikiInner = `## ${title}
 
 **Type**: ${typeLabel} · **Briefing**: [[${briefingBase}]]
 
-${card.markdown}
-
-<details>
-<summary>Discussion appendix · ${title}</summary>
-
-${truncate(discussText, 50000)}
-
-</details>`;
+${bodyMd}`;
       wikiBody = upsertHdSection(wikiBody, `wiki:${title}`, wikiInner);
+    }
+    // 完整讨论只保留一份附录，避免每张卡重复粘贴 + 附录内 ## 污染大纲
+    if (discussText && String(discussText).trim()) {
+      wikiBody = upsertHdSection(wikiBody, "wiki:__appendix__", `## 完整讨论附录
+
+${buildAppendixBlock(discussText)}`);
     }
     if (await this.app.vault.adapter.exists(wikiPath)) {
       await this.app.vault.adapter.write(wikiPath, wikiBody);
@@ -2058,6 +2099,7 @@ tags:
     }
     for (const card of cardList) {
       const title = card.title || this.extractTitle(card.markdown);
+      const bodyMd = normalizeCardMarkdown(card.markdown, title);
       const morningInner = `---
 
 ## Discussion · ${title}
@@ -2066,7 +2108,7 @@ tags:
 **Briefing**: [[${briefingBase}]]  
 **Wiki**: [[${wikiName}]]
 
-${card.markdown}
+${bodyMd}
 `;
       morningBody = upsertHdSection(morningBody, `morning:${title}`, morningInner);
     }

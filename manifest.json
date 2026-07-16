@@ -1,9 +1,9 @@
 {
   "id": "horizon-discuss",
   "name": "Horizon Discuss",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "minAppVersion": "1.5.0",
-  "description": "Discuss daily briefings with AI. Persists chat across restarts. Multi-topic ingest. OpenCode Zen Responses API.",
+  "description": "Discuss daily briefings with AI. Persist chat. Multi-topic ingest. Safe wiki headings (no outline pollution).",
   "author": "Yancy-gate",
   "authorUrl": "https://github.com/Yancy-gate",
   "isDesktopOnly": true
