@@ -1301,12 +1301,12 @@ class HorizonDiscussView extends ItemView {
 
       const focus = this.plugin.settings.focusTopics || DEFAULT_SETTINGS.focusTopics;
       const turnCount = selected.length;
-      const prompt = `你是 Obsidian 知识库整理助手。根据「今日内参摘录」和「用户勾选的全部讨论」，整理成可入库的中文笔记。
+      const prompt = `你是 Obsidian 知识库整理助手。任务是把勾选讨论「消化成可复习的理解笔记」，不是把聊天原文存档。
 
 硬性要求：
 1. 只输出 Markdown，不要用代码围栏包裹全文
-2. **必须覆盖勾选讨论里的每一个用户问题/主题**，不得只留一条、不得把后半段丢掉
-3. 若讨论有多个不同主题（例如：概念解释、机制拆解、横向对比、行业信号、行动项），输出**多张卡片**
+2. **禁止**输出聊天原文、禁止输出「附录」「Discussion appendix」；对话记录由系统另行处理，你只需写整理后的知识
+3. **必须按用户每一个问题/主题各写一张卡**，覆盖全部勾选内容；不得只留一张总括、不得丢掉后半段
 4. 多张卡片之间用单独一行分隔符：
 ---CARD---
 5. 每张卡片结构固定为：
@@ -1316,18 +1316,20 @@ class HorizonDiscussView extends ItemView {
 ### 我的理解
 ### 未决问题
 ### 下一步
-6. 「我的理解」优先保留用户原话与判断；要点要全，但避免空话套话
-7. 「下一步」用 - [ ] 清单，每卡最多 5 条
-8. 类型提示：这是「${typeLabel}」；关注领域：${focus}
-9. 涉及图片时概括可见信息，不臆造
-10. 当前勾选共 ${turnCount} 条消息；若主题≥2，必须输出≥2 张卡片
+6. 「发生了什么 / 我的理解」要写进讨论里真正讲清的知识：定义、机制、对比表、选型结论、类比均可保留；用自己的话重组，但关键事实与数字不要丢
+7. 「我的理解」优先保留用户原话与判断；面向复习，完整优于空话
+8. 「下一步」用 - [ ] 清单，每卡最多 5 条
+9. 卡片正文标题只用 ###（不要用 ##），避免污染大纲
+10. 类型提示：这是「${typeLabel}」；关注领域：${focus}
+11. 涉及图片/网页时概括关键信息，不臆造
+12. 当前勾选共 ${turnCount} 条消息；主题≥2 时必须输出≥2 张卡片
 
 今日内参路径：${this.briefingPath}
 
 内参摘录：
 ${this.briefingExcerpt.slice(0, 12000)}
 
-勾选的讨论（全文，请全部纳入整理）：
+勾选的讨论（请消化进各卡，不要原样粘贴）：
 ${discussText}
 `;
 
@@ -1335,7 +1337,7 @@ ${discussText}
         {
           role: "system",
           content:
-            "你输出干净的 Markdown 笔记。多主题时必须输出多张卡片，用 ---CARD--- 分隔。禁止只总结成一张而丢掉后半讨论。",
+            "你输出整理后的多张 Markdown 理解卡，用 ---CARD--- 分隔。禁止粘贴聊天原文，禁止写附录。把知识写进「发生了什么/我的理解」。",
         },
       ];
       const lastImgMsg = [...selected].reverse().find((m) => m.role === "user" && m.images?.length);
@@ -2065,12 +2067,12 @@ ${relatedYaml}
 ${bodyMd}`;
       wikiBody = upsertHdSection(wikiBody, `wiki:${title}`, wikiInner);
     }
-    // 完整讨论只保留一份附录，避免每张卡重复粘贴 + 附录内 ## 污染大纲
-    if (discussText && String(discussText).trim()) {
-      wikiBody = upsertHdSection(wikiBody, "wiki:__appendix__", `## 完整讨论附录
-
-${buildAppendixBlock(discussText)}`);
-    }
+    // 默认不写聊天原文附录：入库正文必须是整理后的理解卡
+    // 若已有旧版「完整讨论附录」章节，入库时移除，避免再次堆原文
+    wikiBody = wikiBody.replace(
+      /\n*<!--hd:wiki:__appendix__-->[\s\S]*?<!--\/hd:wiki:__appendix__-->\n*/g,
+      "\n"
+    );
     if (await this.app.vault.adapter.exists(wikiPath)) {
       await this.app.vault.adapter.write(wikiPath, wikiBody);
     } else {
